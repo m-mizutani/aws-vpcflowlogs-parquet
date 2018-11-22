@@ -1,0 +1,48 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Parameters:
+  LambdaRoleArn:
+    Type: String
+    Default: ""
+  DstS3Region:
+    Type: String
+  DstS3Bucket:
+    Type: String
+  DstS3Prefix:
+    Type: String
+    Default: ""
+  SnsTopicArn:
+    Type: String
+
+Conditions:
+  LambdaRoleRequired:
+    Fn::Equals: [ { Ref: LambdaRoleArn }, "" ]
+
+Resources:
+  # --------------------------------------------------------
+  # Lambda functions
+  Converter:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: build
+      Handler: main
+      Runtime: go1.x
+      CodeUri: build
+      Timeout: 300
+      MemorySize: 2048
+      Role:
+        Ref: LambdaRoleArn
+      Environment:
+        Variables:
+          S3_REGION:
+            Ref: DstS3Region
+          S3_BUCKET:
+            Ref: DstS3Bucket
+          S3_PREFIX:
+            Ref: DstS3Prefix
+      Events:
+        ReportLine:
+          Type: SNS
+          Properties:
+            Topic:
+              Ref: SnsTopicArn
