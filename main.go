@@ -1,8 +1,6 @@
 package main
 
 import (
-	"bufio"
-	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -11,17 +9,19 @@ import (
 	"strings"
 	"time"
 
+	"github.com/m-mizutani/rlogs"
 	"github.com/pkg/errors"
-	log "github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
-
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go/service/athena"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 )
+
+var logger = logrus.New()
 
 type S3Location struct {
 	S3Region string
@@ -64,12 +64,13 @@ type Results struct {
 }
 
 func main() {
-	log.SetFormatter(&log.JSONFormatter{})
-	log.SetLevel(log.InfoLevel)
+	logger.SetFormatter(&logrus.JSONFormatter{})
+	logger.SetLevel(logrus.InfoLevel)
+
 	lambda.Start(func(ctx context.Context, event events.SNSEvent) (Results, error) {
 		args, err := createArgs(event)
 		if err != nil {
-			log.WithFields(log.Fields{
+			logger.WithFields(logrus.Fields{
 				"error": err,
 				"event": event,
 			}).Error("Fail to createArgs")
@@ -78,7 +79,7 @@ func main() {
 
 		res, err := MainProc(args)
 		if err != nil {
-			log.WithFields(log.Fields{
+			logger.WithFields(logrus.Fields{
 				"error":   err,
 				"event":   event,
 				"results": res,
@@ -123,17 +124,13 @@ type TimeKey struct {
 	minute int
 }
 
-func newTimeKey(timestamp int64) TimeKey {
-	ts := time.Unix(timestamp, 0)
-	m := ts.Minute()
-	tk := TimeKey{
-		year:   ts.Year(),
-		month:  int(ts.Month()),
-		day:    ts.Day(),
-		hour:   ts.Hour(),
-		minute: m - (m % 5),
+func newTimeKey(ts time.Time) TimeKey {
+	return TimeKey{
+		year:  ts.Year(),
+		month: int(ts.Month()),
+		day:   ts.Day(),
+		hour:  ts.Hour(),
 	}
-	return tk
 }
 
 func (x *TimeKey) toDatetime() string {
@@ -145,33 +142,18 @@ func convert(src, dst S3Location) (ResultLog, error) {
 
 	result := ResultLog{src, S3Location{}, 0, 0}
 
-	reader, err := downloadS3(src.S3Region, src.S3Bucket, src.S3Key)
-	if err != nil {
-		return result, errors.Wrap(err, "Fail to dwonload a original log file")
-	}
-	zr, err := gzip.NewReader(reader)
-	if err != nil {
-		return result, errors.Wrap(err, "Fail to decode a downloaded S3 file as gzip")
-	}
+	ch := rlogs.Read(src.S3Region, src.S3Bucket, src.S3Key,
+		&rlogs.S3GzipLines{}, &VpcFlowLogParser{})
 
-	scanner := bufio.NewScanner(zr)
-
-	for scanner.Scan() {
-		var flowlog FlowLog
-		line := scanner.Text()
-		if line == "version account-id interface-id srcaddr dstaddr srcport dstport protocol packets bytes start end action log-status" { // Header
+	for q := range ch {
+		flowlog, ok := q.Record.Entity.(*FlowLog)
+		if !ok {
 			continue
 		}
 
-		err := flowlog.Parse(line)
-		if err != nil {
-			result.ErrorCount++
-			log.WithField("log", line).Warn(err)
-		} else {
-			result.FlowCount++
-		}
+		result.FlowCount++
 
-		tkey := newTimeKey(flowlog.Start)
+		tkey := newTimeKey(q.Record.Timestamp)
 
 		w, ok := wmap[tkey]
 		if !ok {
@@ -190,8 +172,7 @@ func convert(src, dst S3Location) (ResultLog, error) {
 	srcFileName := srcPath[len(srcPath)-1]
 
 	for tkey, w := range wmap {
-		err = w.Close()
-		if err != nil {
+		if err := w.Close(); err != nil {
 			return result, errors.Wrap(err, "Fail to close a Parquet file")
 		}
 
@@ -215,27 +196,13 @@ func MainProc(args Arguments) (Results, error) {
 	var results Results
 
 	for _, tgt := range args.s3Targets {
-
-		log.WithFields(log.Fields{
+		logger.WithFields(logrus.Fields{
 			"region": tgt.S3Region,
 			"bucket": tgt.S3Bucket,
 			"key":    tgt.S3Key,
 		}).Info("Downloading a log file from S3")
 
-		s3Path := strings.Split(tgt.S3Key, "/")
-		var p int
-		for p = 0; s3Path[p] != "AWSLogs" && p < len(s3Path); p++ {
-		}
-		if len(s3Path)-p != 8 {
-			log.WithFields(log.Fields{
-				"s3key": tgt.S3Key,
-				"p":     p,
-			}).Warn("Invalid S3 path")
-			continue
-		}
-
-		dstKey := fmt.Sprintf("%saccount=%s/region=%s", args.dstS3Prefix, s3Path[p+1], s3Path[p+3])
-		dst := S3Location{args.dstS3Region, args.dstS3Bucket, dstKey}
+		dst := S3Location{args.dstS3Region, args.dstS3Bucket, args.dstS3Prefix}
 
 		result, err := convert(tgt, dst)
 		if err != nil {
@@ -245,12 +212,29 @@ func MainProc(args Arguments) (Results, error) {
 		results.Logs = append(results.Logs, result)
 	}
 
+	sql := fmt.Sprintf("ALTER TABLE %s ADD IF NOT EXISTS PARTITION (region='ap-northeast-1') location 's3://mizutani-test/flow-logs-parquet'", os.Getenv("ATHENA_TABLE_NAME"))
+
+	ssn := session.Must(session.NewSession(&aws.Config{
+		Region: aws.String(args.dstS3Region),
+	}))
+	athenaClient := athena.New(ssn)
+
+	resultConf := &athena.ResultConfiguration{}
+	resultConf.SetOutputLocation(fmt.Sprintf("s3://%s/%s/result", args.dstS3Bucket, args.dstS3Prefix))
+
+	input := &athena.StartQueryExecutionInput{
+		QueryString:         aws.String(sql),
+		ResultConfiguration: resultConf,
+	}
+	output, err := athenaClient.StartQueryExecution(input)
+	logger.WithFields(logrus.Fields{"err": err, "input": input, "output": output}).Info("done")
+
 	return results, nil
 }
 
 func uploadS3(s3Region, s3Bucket, s3Key string, reader io.Reader) error {
 	// Upload
-	log.WithFields(log.Fields{"s3Bucket": s3Bucket, "s3key": s3Key}).Info("try to upload")
+	logger.WithFields(logrus.Fields{"s3Bucket": s3Bucket, "s3key": s3Key}).Info("try to upload")
 	ssn := session.Must(session.NewSession(&aws.Config{
 		Region: aws.String(s3Region),
 	}))
@@ -265,24 +249,4 @@ func uploadS3(s3Region, s3Bucket, s3Key string, reader io.Reader) error {
 	}
 
 	return nil
-}
-
-func downloadS3(s3Region, s3Bucket, s3Key string) (io.Reader, error) {
-	log.WithFields(log.Fields{"s3Bucket": s3Bucket, "s3key": s3Key}).Info("try to download")
-	ssn := session.Must(session.NewSession(&aws.Config{
-		Region: aws.String(s3Region),
-	}))
-	svc := s3.New(ssn)
-
-	input := &s3.GetObjectInput{
-		Bucket: aws.String(s3Bucket),
-		Key:    aws.String(s3Key),
-	}
-
-	result, err := svc.GetObject(input)
-	if err != nil {
-		return nil, err
-	}
-
-	return result.Body, nil
 }

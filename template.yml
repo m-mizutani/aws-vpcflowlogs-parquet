@@ -13,10 +13,18 @@ Parameters:
     Default: ""
   SnsTopicArn:
     Type: String
+  SrcS3Bucket:
+    Type: String
+  AthenaTableName:
+    Type: String
+    Default: ""
+
 
 Conditions:
   LambdaRoleRequired:
     Fn::Equals: [ { Ref: LambdaRoleArn }, "" ]
+  AnyS3Bucket:
+    Fn::Equals: [ { Ref: SrcS3Bucket }, "" ]
 
 Resources:
   # --------------------------------------------------------
@@ -31,7 +39,7 @@ Resources:
       Timeout: 300
       MemorySize: 2048
       Role:
-        Ref: LambdaRoleArn
+        Fn::If: [ LambdaRoleRequired, {"Fn::GetAtt": LambdaRole.Arn}, {Ref: LambdaRoleArn} ]
       Environment:
         Variables:
           S3_REGION:
@@ -40,9 +48,68 @@ Resources:
             Ref: DstS3Bucket
           S3_PREFIX:
             Ref: DstS3Prefix
+          ATHENA_TABLE_NAME:
+            Ref: AthenaTableName
       Events:
         ReportLine:
           Type: SNS
           Properties:
             Topic:
               Ref: SnsTopicArn
+
+  # --------------------------------------------------------
+  # IAM Roles
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Condition: LambdaRoleRequired
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: ["lambda.amazonaws.com"]
+            Action: ["sts:AssumeRole"]
+      Path: "/"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: "S3Writable"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:ListBucket
+                  - s3:PutObject
+                  - s3:GetBucketLocation
+                  - s3:ListBucketMultipartUploads
+                  - s3:ListMultipartUploadParts
+                  - s3:AbortMultipartUpload
+                  - s3:CreateBucket
+                Resource:
+                  - Fn::Sub: [ "arn:aws:s3:::${bucket}", { bucket: { "Ref": DstS3Bucket } } ]
+                  - Fn::Sub: [ "arn:aws:s3:::${bucket}/${prefix}*", { bucket: { "Ref": DstS3Bucket }, prefix: {"Ref": DstS3Prefix} } ]
+        - PolicyName: "S3Readable"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:ListBucket
+                Resource:
+                  - Fn::Sub: [ "arn:aws:s3:::${bucket}", { bucket: { "Ref": SrcS3Bucket } } ]
+                  - Fn::Sub: [ "arn:aws:s3:::${bucket}/*", { bucket: { "Ref": SrcS3Bucket } } ]
+        - PolicyName: "QueryExecutable"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - athena:StartQueryExecution
+                Resource:
+                  - "*"

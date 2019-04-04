@@ -38,7 +38,7 @@ func NewParquetFlowLogWriter() (ParquetFlowLogWriter, error) {
 	return x, nil
 }
 
-func (x *ParquetFlowLogWriter) Write(v FlowLog) error {
+func (x *ParquetFlowLogWriter) Write(v *FlowLog) error {
 	if err := x.writer.Write(v); err != nil {
 		return err
 	}

@@ -4,14 +4,16 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/m-mizutani/rlogs"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 )
 
 type FlowLog struct {
-	Version int32 `parquet:"name=version, type=INT32"`
-	// AccountID   string `parquet:"name=accountid, type=UTF8, encoding=PLAIN_DICTIONARY"`
+	Version     int32  `parquet:"name=version, type=INT32"`
+	AccountID   string `parquet:"name=accountid, type=UTF8, encoding=PLAIN_DICTIONARY"`
 	InterfaceID string `parquet:"name=interfaceid, type=UTF8, encoding=PLAIN_DICTIONARY"`
 	SrcAddr     string `parquet:"name=srcaddr, type=UTF8, encoding=PLAIN_DICTIONARY"`
 	DstAddr     string `parquet:"name=dstaddr, type=UTF8, encoding=PLAIN_DICTIONARY"`
@@ -26,15 +28,27 @@ type FlowLog struct {
 	LogStatus   string `parquet:"name=logstatus, type=UTF8, encoding=PLAIN_DICTIONARY"`
 }
 
-func (x *FlowLog) Parse(line string) error {
+type VpcFlowLogParser struct{}
+
+func (x *VpcFlowLogParser) Parse(data []byte) ([]rlogs.LogRecord, error) {
+	line := string(data)
+
 	row := strings.Split(line, " ")
 	if len(row) != 14 {
 		log.WithField("line", line).Info("Fail to parse")
-		return errors.New(fmt.Sprintf("Invalid row length (expected 14, but %d)", len(row)))
+		return nil, errors.New(fmt.Sprintf("Invalid row length (expected 14, but %d)", len(row)))
 	}
 
-	*x = FlowLog{
-		// AccountID:   row[1],
+	if row[0] == "version" {
+		return nil, nil // Skip header
+	}
+
+	if row[0] != "2" {
+		return nil, errors.New(fmt.Sprintf("Unsupported VPC Flow Logs version: %s", row[0]))
+	}
+
+	log := FlowLog{
+		AccountID:   row[1],
 		InterfaceID: row[2],
 		SrcAddr:     row[3],
 		DstAddr:     row[4],
@@ -42,53 +56,43 @@ func (x *FlowLog) Parse(line string) error {
 		LogStatus:   row[13],
 	}
 
-	n0, err := strconv.Atoi(row[0])
-	if err != nil {
-		return err
+	if n0, err := strconv.Atoi(row[0]); err == nil {
+		log.Version = int32(n0)
 	}
-	x.Version = int32(n0)
 
-	n5, err := strconv.Atoi(row[5])
-	if err != nil {
-		return err
+	if n5, err := strconv.Atoi(row[5]); err == nil {
+		log.SrcPort = int32(n5)
 	}
-	x.SrcPort = int32(n5)
 
-	n6, err := strconv.Atoi(row[6])
-	if err != nil {
-		return err
+	if n6, err := strconv.Atoi(row[6]); err == nil {
+		log.DstPort = int32(n6)
 	}
-	x.DstPort = int32(n6)
 
-	n7, err := strconv.Atoi(row[7])
-	if err != nil {
-		return err
+	if n7, err := strconv.Atoi(row[7]); err == nil {
+		log.Protocol = int32(n7)
 	}
-	x.Protocol = int32(n7)
 
-	n8, err := strconv.Atoi(row[8])
-	if err != nil {
-		return err
+	if n8, err := strconv.Atoi(row[8]); err == nil {
+		log.Packets = int32(n8)
 	}
-	x.Packets = int32(n8)
 
-	n9, err := strconv.Atoi(row[9])
-	if err != nil {
-		return err
+	if n9, err := strconv.Atoi(row[9]); err == nil {
+		log.Bytes = int32(n9)
 	}
-	x.Bytes = int32(n9)
 
-	n10, err := strconv.Atoi(row[10])
-	if err != nil {
-		return err
+	if n10, err := strconv.Atoi(row[10]); err == nil {
+		log.Start = int64(n10)
 	}
-	x.Start = int64(n10)
+	ts := time.Unix(log.Start, 0)
 
-	n11, err := strconv.Atoi(row[11])
-	if err != nil {
-		return err
+	if n11, err := strconv.Atoi(row[11]); err == nil {
+		log.End = int64(n11)
 	}
-	x.End = int64(n11)
 
-	return nil
+	return []rlogs.LogRecord{{
+		Entity:    &log,
+		Encodable: &log,
+		Timestamp: ts,
+		Tag:       "aws.vpcflowlogs",
+	}}, nil
 }
