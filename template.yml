@@ -17,14 +17,18 @@ Parameters:
     Type: String
   AthenaTableName:
     Type: String
+  AthenaDatabaseName:
+    Type: String
     Default: ""
-
+  HasAthenaDatabase:
+    Type: String
+    Default: ""
 
 Conditions:
   LambdaRoleRequired:
     Fn::Equals: [ { Ref: LambdaRoleArn }, "" ]
-  AnyS3Bucket:
-    Fn::Equals: [ { Ref: SrcS3Bucket }, "" ]
+  AthenaDatabaseRequired:
+    Fn::Equals: [ { Ref: HasAthenaDatabase }, "" ]
 
 Resources:
   # --------------------------------------------------------
@@ -48,6 +52,8 @@ Resources:
             Ref: DstS3Bucket
           S3_PREFIX:
             Ref: DstS3Prefix
+          ATHENA_DATABASE_NAME:
+            Ref: AthenaDatabaseName
           ATHENA_TABLE_NAME:
             Ref: AthenaTableName
       Events:
@@ -56,6 +62,71 @@ Resources:
           Properties:
             Topic:
               Ref: SnsTopicArn
+
+  FlowLogDB:
+    Type: AWS::Glue::Database
+    Condition: AthenaDatabaseRequired
+    Properties:
+      DatabaseInput:
+        Description: "Log Database"
+        Name:
+          Ref: AthenaDatabaseName
+      CatalogId:
+        Ref: AWS::AccountId
+
+  FlowLogTable:
+    Type: AWS::Glue::Table
+    Properties:
+      TableInput:
+        Description: "FlowLog table"
+        TableType: EXTERNAL_TABLE
+        PartitionKeys:
+          - Name: dt
+            Type: string
+          - Name: account
+            Type: string
+        StorageDescriptor:
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          Columns:
+            - Name: version
+              Type: int
+            - Name: accountid
+              Type: string
+            - Name: interfaceid
+              Type: string
+            - Name: srcaddr
+              Type: string
+            - Name: dstaddr
+              Type: string
+            - Name: srcport
+              Type: int
+            - Name: dstport
+              Type: int
+            - Name: protocol
+              Type: int
+            - Name: packets
+              Type: int
+            - Name: bytes
+              Type: int
+            - Name: start_ts
+              Type: bigint
+            - Name: end_ts
+              Type: int
+            - Name: action
+              Type: string
+            - Name: logstatus
+              Type: string
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Location:
+            Fn::Sub: "s3://${DstS3Bucket}/${DstS3Prefix}/"
+        Name:
+          Ref: AthenaTableName
+      DatabaseName:
+        Ref: AthenaDatabaseName
+      CatalogId:
+        Ref: AWS::AccountId
 
   # --------------------------------------------------------
   # IAM Roles
@@ -108,8 +179,30 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              - Effect: "Allow"
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:UpdateDatabase
+                  - glue:GetTable
+                  - glue:BatchCreatePartition
+                Resource:
+                  - Fn::Sub: "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${AthenaDatabaseName}"
+                  - Fn::Sub: "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${AthenaDatabaseName}/*"
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:BatchCreatePartition
+                Resource:
+                  - Fn::Sub: arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                Resource:
+                  - Fn::Sub: arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/default
+              - Effect: Allow
                 Action:
                   - athena:StartQueryExecution
+                  - athena:GetQueryExecution
                 Resource:
                   - "*"

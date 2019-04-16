@@ -34,16 +34,20 @@ func TestWriteFile(t *testing.T) {
 	scanner := bufio.NewScanner(fd)
 	require.NoError(t, err)
 
+	parser := flowlog.VpcFlowLogParser{}
+
 	for scanner.Scan() {
 		line := scanner.Text()
 		if strings.HasPrefix(line, "version ") {
 			continue
 		}
 
-		var flog flowlog.FlowLog
-		err := flog.Parse(scanner.Text())
+		flogs, err := parser.Parse([]byte(scanner.Text()))
 
 		require.NoError(t, err)
+		assert.Equal(t, 1, len(flogs))
+		flog, ok := flogs[0].Entity.(*flowlog.FlowLog)
+		require.True(t, ok)
 		err = w.Write(flog)
 		require.NoError(t, err)
 	}
@@ -70,15 +74,19 @@ func TestParse(t *testing.T) {
 	require.NoError(t, err)
 	defer fd.Close()
 
+	parser := flowlog.VpcFlowLogParser{}
 	scanner := bufio.NewScanner(fd)
 	require.NoError(t, err)
 
 	require.True(t, scanner.Scan()) // 1st line
 	require.True(t, scanner.Scan()) // 2nd line
 
-	var flog flowlog.FlowLog
-	err = flog.Parse(scanner.Text())
+	flogs, err := parser.Parse([]byte(scanner.Text()))
 	require.NoError(t, err)
+
+	flog, ok := flogs[0].Entity.(*flowlog.FlowLog)
+	require.True(t, ok)
+
 	assert.Equal(t, flog.Version, int32(2))
 	// assert.Equal(t, flog.AccountID, "123456789000")
 	assert.Equal(t, flog.InterfaceID, "eni-70594239")
@@ -96,9 +104,11 @@ func TestParse(t *testing.T) {
 }
 
 type testParameters struct {
-	S3Region string `json:"s3region"`
-	S3Bucket string `json:"s3bucket"`
-	S3Prefix string `json:"s3prefix"`
+	S3Region           string `json:"s3region"`
+	S3Bucket           string `json:"s3bucket"`
+	S3Prefix           string `json:"s3prefix"`
+	AthenaDatabaseName string `json:"athena_database_name"`
+	AthenaTableName    string `json:"athena_table_name"`
 }
 
 func loadTestParameters() testParameters {
@@ -142,11 +152,8 @@ func TestMain(t *testing.T) {
 
 	require.NoError(t, err)
 
-	args := flowlog.NewArguments(p.S3Region, p.S3Bucket, dstS3Prefix)
+	args := flowlog.NewArguments(p.S3Region, p.S3Bucket, dstS3Prefix, p.AthenaTableName, p.AthenaDatabaseName)
 	args.AddSrc(p.S3Region, p.S3Bucket, srcS3Key)
-	results, err := flowlog.MainProc(args)
+	err = flowlog.Handler(args)
 	require.NoError(t, err)
-	assert.Equal(t, 1, len(results.Logs))
-	assert.Equal(t, 2, results.Logs[0].FlowCount)
-	assert.Equal(t, 0, results.Logs[0].ErrorCount)
 }

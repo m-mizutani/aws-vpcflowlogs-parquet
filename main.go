@@ -6,10 +6,8 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strings"
 	"time"
 
-	"github.com/m-mizutani/rlogs"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 
@@ -30,17 +28,21 @@ type S3Location struct {
 }
 
 type Arguments struct {
-	s3Targets   []S3Location
-	dstS3Region string
-	dstS3Bucket string
-	dstS3Prefix string
+	s3Targets          []S3Location
+	dstS3Region        string
+	dstS3Bucket        string
+	dstS3Prefix        string
+	athenaTableName    string
+	athenaDatabaseName string
 }
 
-func NewArguments(s3Region, s3Bucket, s3Prefix string) Arguments {
+func newArguments(s3Region, s3Bucket, s3Prefix, athenaTableName, athenaDatabaseName string) Arguments {
 	args := Arguments{
-		dstS3Region: s3Region,
-		dstS3Bucket: s3Bucket,
-		dstS3Prefix: s3Prefix,
+		dstS3Region:        s3Region,
+		dstS3Bucket:        s3Bucket,
+		dstS3Prefix:        s3Prefix,
+		athenaTableName:    athenaTableName,
+		athenaDatabaseName: athenaDatabaseName,
 	}
 	return args
 }
@@ -54,47 +56,33 @@ func (x *Arguments) AddSrc(s3Region, s3Bucket, s3Key string) {
 	x.s3Targets = append(x.s3Targets, tgt)
 }
 
-type ResultLog struct {
-	Src, Dst   S3Location
-	FlowCount  int
-	ErrorCount int
-}
-type Results struct {
-	Logs []ResultLog
-}
-
 func main() {
 	logger.SetFormatter(&logrus.JSONFormatter{})
 	logger.SetLevel(logrus.InfoLevel)
 
-	lambda.Start(func(ctx context.Context, event events.SNSEvent) (Results, error) {
+	lambda.Start(func(ctx context.Context, event events.SNSEvent) error {
 		args, err := createArgs(event)
 		if err != nil {
 			logger.WithFields(logrus.Fields{
 				"error": err,
 				"event": event,
 			}).Error("Fail to createArgs")
-			return Results{}, err
+			return err
 		}
 
-		res, err := MainProc(args)
-		if err != nil {
+		if err := handler(args); err != nil {
 			logger.WithFields(logrus.Fields{
-				"error":   err,
-				"event":   event,
-				"results": res,
+				"error": err,
+				"event": event,
 			}).Error("Error in main procedure")
 		}
-		return res, nil
+		return nil
 	})
 }
 
 func createArgs(event events.SNSEvent) (Arguments, error) {
-	args := Arguments{
-		dstS3Region: os.Getenv("S3_REGION"),
-		dstS3Bucket: os.Getenv("S3_BUCKET"),
-		dstS3Prefix: os.Getenv("S3_PREFIX"),
-	}
+	args := newArguments(os.Getenv("S3_REGION"), os.Getenv("S3_BUCKET"),
+		os.Getenv("S3_PREFIX"), os.Getenv("ATHENA_TABLE_NAME"), os.Getenv("ATHENA_DATABASE_NAME"))
 
 	for _, record := range event.Records {
 		var s3Event events.S3Event
@@ -116,84 +104,8 @@ func createArgs(event events.SNSEvent) (Arguments, error) {
 	return args, nil
 }
 
-type TimeKey struct {
-	year   int
-	month  int
-	day    int
-	hour   int
-	minute int
-}
-
-func newTimeKey(ts time.Time) TimeKey {
-	return TimeKey{
-		year:  ts.Year(),
-		month: int(ts.Month()),
-		day:   ts.Day(),
-		hour:  ts.Hour(),
-	}
-}
-
-func (x *TimeKey) toDatetime() string {
-	return fmt.Sprintf("%04d-%02d-%02d-%02d-%02d", x.year, x.month, x.day, x.hour, x.minute-(x.minute%5))
-}
-
-func convert(src, dst S3Location) (ResultLog, error) {
-	wmap := map[TimeKey]*ParquetFlowLogWriter{}
-
-	result := ResultLog{src, S3Location{}, 0, 0}
-
-	ch := rlogs.Read(src.S3Region, src.S3Bucket, src.S3Key,
-		&rlogs.S3GzipLines{}, &VpcFlowLogParser{})
-
-	for q := range ch {
-		flowlog, ok := q.Record.Entity.(*FlowLog)
-		if !ok {
-			continue
-		}
-
-		result.FlowCount++
-
-		tkey := newTimeKey(q.Record.Timestamp)
-
-		w, ok := wmap[tkey]
-		if !ok {
-			newWriter, err := NewParquetFlowLogWriter()
-			if err != nil {
-				return result, err
-			}
-			w = &newWriter
-			wmap[tkey] = w
-		}
-
-		w.Write(flowlog)
-	}
-
-	srcPath := strings.Split(src.S3Key, "/")
-	srcFileName := srcPath[len(srcPath)-1]
-
-	for tkey, w := range wmap {
-		if err := w.Close(); err != nil {
-			return result, errors.Wrap(err, "Fail to close a Parquet file")
-		}
-
-		fd, err := os.Open(w.FileName)
-		if err != nil {
-			return result, errors.Wrap(err, "Fail to close a Parquet file")
-		}
-
-		dstKey := fmt.Sprintf("%s/dt=%s/%s.parquet", dst.S3Key, tkey.toDatetime(), srcFileName)
-		err = uploadS3(dst.S3Region, dst.S3Bucket, dstKey, fd)
-		if err != nil {
-			return result, err
-		}
-	}
-
-	return result, nil
-}
-
-// MainProc is a main function of VPCFlowLogs converter.
-func MainProc(args Arguments) (Results, error) {
-	var results Results
+func handler(args Arguments) error {
+	pkeySet := map[partitionKey]struct{}{}
 
 	for _, tgt := range args.s3Targets {
 		logger.WithFields(logrus.Fields{
@@ -204,32 +116,59 @@ func MainProc(args Arguments) (Results, error) {
 
 		dst := S3Location{args.dstS3Region, args.dstS3Bucket, args.dstS3Prefix}
 
-		result, err := convert(tgt, dst)
+		res, err := convert(tgt, dst)
 		if err != nil {
-			return results, err
+			return err
 		}
 
-		results.Logs = append(results.Logs, result)
+		for _, pkey := range res.partitionKeys {
+			logger.WithField("pkey", pkey).Info("created pkey")
+			pkeySet[pkey] = struct{}{}
+		}
 	}
 
-	sql := fmt.Sprintf("ALTER TABLE %s ADD IF NOT EXISTS PARTITION (region='ap-northeast-1') location 's3://mizutani-test/flow-logs-parquet'", os.Getenv("ATHENA_TABLE_NAME"))
+	for pkey := range pkeySet {
+		// athenaDBName := os.Getenv("ATHENA_DATABASE_NAME")
+		sql := fmt.Sprintf("ALTER TABLE %s.%s ADD IF NOT EXISTS PARTITION (dt='%s', account='%s') LOCATION 's3://%s/%s%s'", args.athenaDatabaseName, args.athenaTableName, pkey.Date(), pkey.accountID, args.dstS3Bucket, args.dstS3Prefix, pkey)
 
-	ssn := session.Must(session.NewSession(&aws.Config{
-		Region: aws.String(args.dstS3Region),
-	}))
-	athenaClient := athena.New(ssn)
+		ssn := session.Must(session.NewSession(&aws.Config{
+			Region: aws.String(args.dstS3Region),
+		}))
+		athenaClient := athena.New(ssn)
 
-	resultConf := &athena.ResultConfiguration{}
-	resultConf.SetOutputLocation(fmt.Sprintf("s3://%s/%s/result", args.dstS3Bucket, args.dstS3Prefix))
+		resultConf := &athena.ResultConfiguration{}
+		resultConf.SetOutputLocation(fmt.Sprintf("s3://%s/%sresult", args.dstS3Bucket, args.dstS3Prefix))
 
-	input := &athena.StartQueryExecutionInput{
-		QueryString:         aws.String(sql),
-		ResultConfiguration: resultConf,
+		input := &athena.StartQueryExecutionInput{
+			QueryString:         aws.String(sql),
+			ResultConfiguration: resultConf,
+		}
+		output1, err := athenaClient.StartQueryExecution(input)
+		logger.WithFields(logrus.Fields{"err": err, "input": input, "output": output1}).Info("done")
+
+		if err != nil {
+			return errors.Wrap(err, "Fail to execute a partitioning query")
+		}
+
+		for {
+			output2, err := athenaClient.GetQueryExecution(&athena.GetQueryExecutionInput{
+				QueryExecutionId: output1.QueryExecutionId,
+			})
+			if err != nil {
+				return errors.Wrap(err, "Fail to get an execution result")
+			}
+
+			if *output2.QueryExecution.Status.State == "RUNNING" {
+				logger.WithField("output", output2).Info("Waiting...")
+				time.Sleep(time.Second * 3)
+				continue
+			}
+
+			logger.WithField("output", output2).Info("done")
+			break
+		}
 	}
-	output, err := athenaClient.StartQueryExecution(input)
-	logger.WithFields(logrus.Fields{"err": err, "input": input, "output": output}).Info("done")
-
-	return results, nil
+	return nil
 }
 
 func uploadS3(s3Region, s3Bucket, s3Key string, reader io.Reader) error {

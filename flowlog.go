@@ -44,7 +44,7 @@ func (x *VpcFlowLogParser) Parse(data []byte) ([]rlogs.LogRecord, error) {
 	}
 
 	if row[0] != "2" {
-		return nil, errors.New(fmt.Sprintf("Unsupported VPC Flow Logs version: %s", row[0]))
+		return nil, errors.New(fmt.Sprintf("Unsupported VPC Flow Logs version:cat  %s", row[0]))
 	}
 
 	log := FlowLog{
