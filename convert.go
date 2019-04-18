@@ -27,7 +27,7 @@ func newPartitionKey(ts time.Time, flog *FlowLog) partitionKey {
 }
 
 func (x partitionKey) String() string {
-	return fmt.Sprintf("%s/%04d/%02d/%02d", x.accountID, x.year, x.month, x.day)
+	return fmt.Sprintf("logs/%s/%04d/%02d/%02d", x.accountID, x.year, x.month, x.day)
 }
 
 func (x partitionKey) Date() string {

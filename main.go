@@ -36,6 +36,10 @@ type Arguments struct {
 	athenaDatabaseName string
 }
 
+type awsEvent struct {
+	Records []map[string]interface{} `json:"Records"`
+}
+
 func newArguments(s3Region, s3Bucket, s3Prefix, athenaTableName, athenaDatabaseName string) Arguments {
 	args := Arguments{
 		dstS3Region:        s3Region,
@@ -60,7 +64,7 @@ func main() {
 	logger.SetFormatter(&logrus.JSONFormatter{})
 	logger.SetLevel(logrus.InfoLevel)
 
-	lambda.Start(func(ctx context.Context, event events.SNSEvent) error {
+	lambda.Start(func(ctx context.Context, event awsEvent) error {
 		args, err := createArgs(event)
 		if err != nil {
 			logger.WithFields(logrus.Fields{
@@ -80,25 +84,66 @@ func main() {
 	})
 }
 
-func createArgs(event events.SNSEvent) (Arguments, error) {
-	args := newArguments(os.Getenv("S3_REGION"), os.Getenv("S3_BUCKET"),
-		os.Getenv("S3_PREFIX"), os.Getenv("ATHENA_TABLE_NAME"), os.Getenv("ATHENA_DATABASE_NAME"))
+func recordToTarget(record map[string]interface{}) ([]S3Location, error) {
+	var s3Records []events.S3EventRecord
+	if _, ok := record["Sns"]; ok {
+		// Extract S3 event records from SNS event record
+		raw, err := json.Marshal(record)
+		if err != nil {
+			return nil, errors.Wrap(err, "Fail to marshal SNS record")
+		}
+
+		var snsRecord events.SNSEventRecord
+		if err := json.Unmarshal(raw, &snsRecord); err != nil {
+			return nil, errors.Wrap(err, "Fail to unmarshal SNS record")
+		}
+
+		var s3Event events.S3Event
+		if err := json.Unmarshal([]byte(snsRecord.SNS.Message), &s3Event); err != nil {
+			return nil, errors.Wrap(err, "Fail to unmarshal S3 event in SNS message")
+		}
+
+		s3Records = s3Event.Records
+
+	} else if _, ok := record["s3"]; ok {
+		// Unmarshal general record to S3 event record
+		raw, err := json.Marshal(record)
+		if err != nil {
+			return nil, errors.Wrap(err, "Fail to marshal SNS record")
+		}
+
+		if err := json.Unmarshal(raw, &s3Records); err != nil {
+			return nil, errors.Wrap(err, "Fail to unmarshal S3 event record")
+		}
+
+	} else {
+		// Unsupported
+		logger.WithField("record", record).Warn("Unsupported AWS record")
+		return nil, nil
+	}
+
+	locations := []S3Location{}
+	for _, s3Record := range s3Records {
+		locations = append(locations, S3Location{
+			S3Bucket: s3Record.S3.Bucket.Name,
+			S3Key:    s3Record.S3.Object.Key,
+			S3Region: s3Record.AWSRegion,
+		})
+	}
+
+	return locations, nil
+}
+
+func createArgs(event awsEvent) (Arguments, error) {
+	args := newArguments(os.Getenv("S3_REGION"), os.Getenv("S3_BUCKET"), os.Getenv("S3_PREFIX"), os.Getenv("ATHENA_TABLE_NAME"), os.Getenv("ATHENA_DATABASE_NAME"))
 
 	for _, record := range event.Records {
-		var s3Event events.S3Event
-		err := json.Unmarshal([]byte(record.SNS.Message), &s3Event)
+		locations, err := recordToTarget(record)
 		if err != nil {
-			return args, errors.Wrap(err, "Fail to unmarshal SNS message")
+			return args, err
 		}
 
-		for _, s3Record := range s3Event.Records {
-			tgt := S3Location{
-				S3Bucket: s3Record.S3.Bucket.Name,
-				S3Key:    s3Record.S3.Object.Key,
-				S3Region: s3Record.AWSRegion,
-			}
-			args.s3Targets = append(args.s3Targets, tgt)
-		}
+		args.s3Targets = append(args.s3Targets, locations...)
 	}
 
 	return args, nil
@@ -150,22 +195,24 @@ func handler(args Arguments) error {
 			return errors.Wrap(err, "Fail to execute a partitioning query")
 		}
 
-		for {
-			output2, err := athenaClient.GetQueryExecution(&athena.GetQueryExecutionInput{
-				QueryExecutionId: output1.QueryExecutionId,
-			})
-			if err != nil {
-				return errors.Wrap(err, "Fail to get an execution result")
-			}
+		if os.Getenv("CHECK_QUERY_RESULT") != "" {
+			for {
+				output2, err := athenaClient.GetQueryExecution(&athena.GetQueryExecutionInput{
+					QueryExecutionId: output1.QueryExecutionId,
+				})
+				if err != nil {
+					return errors.Wrap(err, "Fail to get an execution result")
+				}
 
-			if *output2.QueryExecution.Status.State == "RUNNING" {
-				logger.WithField("output", output2).Info("Waiting...")
-				time.Sleep(time.Second * 3)
-				continue
-			}
+				if *output2.QueryExecution.Status.State == "RUNNING" {
+					logger.WithField("output", output2).Info("Waiting...")
+					time.Sleep(time.Second * 3)
+					continue
+				}
 
-			logger.WithField("output", output2).Info("done")
-			break
+				logger.WithField("output", output2).Info("done")
+				break
+			}
 		}
 	}
 	return nil

@@ -7,7 +7,18 @@ endif
 CODE_S3_BUCKET := $(shell cat $(STACK_CONFIG) | grep CodeS3Bucket | cut -d = -f 2)
 CODE_S3_PREFIX := $(shell cat $(STACK_CONFIG) | grep CodeS3Prefix | cut -d = -f 2)
 STACK_NAME := $(shell cat $(STACK_CONFIG) | grep StackName | cut -d = -f 2)
-PARAMETERS := $(shell cat $(STACK_CONFIG) | grep -e LambdaRoleArn -e DstS3Region -e DstS3Bucket -e DstS3Prefix -e SrcS3Bucket -e SnsTopicArn -e AthenaTableName -e AthenaDatabaseName -e HasAthenaDatabase | tr '\n' ' ')
+PARAMETERS := $(shell cat $(STACK_CONFIG) | grep \
+	-e DstS3Region \
+	-e DstS3Bucket \
+	-e DstS3Prefix \
+	-e AthenaTableName \
+	-e InvokeSnsTopicName \
+	-e DlqSnsTopicName \
+	-e AthenaDatabaseName \
+	-e HasAthenaDatabase \
+	-e LambdaRoleArn \
+	-e SrcS3Bucket \
+	| tr '\n' ' ')
 TEMPLATE_FILE=template.yml
 
 all: deploy

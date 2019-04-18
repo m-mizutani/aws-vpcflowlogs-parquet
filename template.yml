@@ -1,9 +1,6 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 Parameters:
-  LambdaRoleArn:
-    Type: String
-    Default: ""
   DstS3Region:
     Type: String
   DstS3Bucket:
@@ -11,12 +8,16 @@ Parameters:
   DstS3Prefix:
     Type: String
     Default: ""
-  SnsTopicArn:
-    Type: String
-  SrcS3Bucket:
-    Type: String
   AthenaTableName:
     Type: String
+
+  InvokeSnsTopicName:
+    Type: String
+    Default: ""
+  DlqSnsTopicName:
+    Type: String
+    Default: ""
+
   AthenaDatabaseName:
     Type: String
     Default: ""
@@ -24,9 +25,24 @@ Parameters:
     Type: String
     Default: ""
 
+  LambdaRoleArn:
+    Type: String
+    Default: ""
+  SrcS3Bucket:
+    Type: String
+    Default: "-"
+
+  ConcurrentExecution:
+    Type: Number
+    Default: 5
+
 Conditions:
   LambdaRoleRequired:
     Fn::Equals: [ { Ref: LambdaRoleArn }, "" ]
+  IsDefaultInvokeSnsTopicName:
+    Fn::Equals: [ { Ref: InvokeSnsTopicName }, "" ]
+  IsDefaultDlqSnsTopicName:
+    Fn::Equals: [ { Ref: DlqSnsTopicName }, "" ]
   AthenaDatabaseRequired:
     Fn::Equals: [ { Ref: HasAthenaDatabase }, "" ]
 
@@ -42,6 +58,8 @@ Resources:
       CodeUri: build
       Timeout: 300
       MemorySize: 2048
+      ReservedConcurrentExecutions:
+        Ref: ConcurrentExecution
       Role:
         Fn::If: [ LambdaRoleRequired, {"Fn::GetAtt": LambdaRole.Arn}, {Ref: LambdaRoleArn} ]
       Environment:
@@ -61,7 +79,28 @@ Resources:
           Type: SNS
           Properties:
             Topic:
-              Ref: SnsTopicArn
+              Ref: InvokeSnsTopic
+      DeadLetterQueue:
+        Type: SNS
+        TargetArn:
+          Ref: DlqSnsTopic
+
+  InvokeSnsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName:
+        Fn::If:
+          - IsDefaultInvokeSnsTopicName
+          - {"Fn::Sub": "VPCFlowLogsParquet-Invoke-${AWS::StackName}"}
+          - {"Ref": InvokeSnsTopicName}
+  DlqSnsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName:
+        Fn::If:
+          - IsDefaultDlqSnsTopicName
+          - {"Fn::Sub": "VPCFlowLogsParquet-Dlq-${AWS::StackName}"}
+          - {"Ref": DlqSnsTopicName}
 
   FlowLogDB:
     Type: AWS::Glue::Database
